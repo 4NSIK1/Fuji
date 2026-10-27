@@ -304,7 +304,7 @@ class InputWindow(wx.Frame):
     def __init__(self):
         super().__init__(
             parent=None,
-            title="Fuji - Forensic Unattended Juicy Imaging",
+            title="Fuji-Forensic Unattended Juicy Imager",
             size=(540, 400),
             style=wx.DEFAULT_FRAME_STYLE & ~(wx.RESIZE_BORDER | wx.MAXIMIZE_BOX),
         )
@@ -314,7 +314,7 @@ class InputWindow(wx.Frame):
         # Components
         title = wx.StaticText(panel, label="Fuji")
         set_font(title, size=36, weight=wx.FONTWEIGHT_EXTRABOLD)
-        desc = wx.StaticText(panel, label="Forensic Unattended Juicy Imaging")
+        desc = wx.StaticText(panel, label="Forensic Unattended Juicy Imager")
         set_font(desc, size=18, weight=wx.FONTWEIGHT_BOLD)
 
         byline_text = wx.StaticText(panel, label=f"Version {VERSION} by {AUTHOR}")
@@ -363,6 +363,30 @@ class InputWindow(wx.Frame):
         for method in METHODS:
             description_label = f"<b>{method.name}:</b> {dedent(method.description)}"
             self.description_labels.append(description_label)
+
+        # Encryption controls
+        self.encrypt_checkbox = wx.CheckBox(
+            panel, label="Encrypt the output image (AES-256)"
+        )
+        self.encrypt_checkbox.SetValue(bool(PARAMS.passphrase))
+        self.encrypt_checkbox.Bind(wx.EVT_CHECKBOX, self.on_encrypt_toggled)
+
+        passphrase_label = wx.StaticText(panel, label="Passphrase:")
+        self.passphrase_text = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        confirm_label = wx.StaticText(panel, label="Confirm passphrase:")
+        self.confirm_text = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        self.passphrase_labels = [passphrase_label, confirm_label]
+
+        self.encrypt_warning = wx.StaticText(
+            panel,
+            label="There is no recovery if the passphrase is lost.",
+        )
+        self.encrypt_warning.SetForegroundColour(RED_COLOR)
+
+        self.hash_both_checkbox = wx.CheckBox(
+            panel, label="Also hash the unencrypted image (adds a conversion pass)"
+        )
+        self.hash_both_checkbox.SetValue(PARAMS.hash_both)
 
         # Sound checkbox
         self.sound_checkbox = wx.CheckBox(
@@ -418,6 +442,26 @@ class InputWindow(wx.Frame):
         self.describe_method(0)
 
         vbox.Add((0, 20))
+
+        vbox.Add(self.encrypt_checkbox, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 5)
+        self.encryption_info = wx.FlexGridSizer(cols=2, hgap=10, vgap=10)
+        self.encryption_info.Add(
+            passphrase_label, 0, wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL
+        )
+        self.encryption_info.Add(self.passphrase_text, 1, wx.EXPAND)
+        self.encryption_info.Add(
+            confirm_label, 0, wx.ALIGN_LEFT | wx.ALIGN_CENTER_VERTICAL
+        )
+        self.encryption_info.Add(self.confirm_text, 1, wx.EXPAND)
+        self.encryption_info.AddGrowableCol(1, 1)
+        vbox.Add(self.encryption_info, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        vbox.Add(
+            self.encrypt_warning, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.TOP | wx.BOTTOM, 5
+        )
+        vbox.Add(
+            self.hash_both_checkbox, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 10
+        )
+
         if not RECOVERY:
             vbox.Add(self.sound_checkbox, 0, wx.ALIGN_CENTER_HORIZONTAL | wx.BOTTOM, 10)
         else:
@@ -431,6 +475,9 @@ class InputWindow(wx.Frame):
         sizer = wx.BoxSizer(wx.VERTICAL)
         sizer.Add(panel)
         self.SetSizerAndFit(sizer)
+
+        # Only once the sizers exist, or Layout()/Fit() have nothing to act on
+        self._show_encryption_fields(self.encrypt_checkbox.GetValue())
         self.Center()
 
         # Bind close and create a menu bar
@@ -462,6 +509,25 @@ class InputWindow(wx.Frame):
         method_index = self.method_choice.GetSelection()
         self.describe_method(method_index)
 
+    def _show_encryption_fields(self, show: bool):
+        for widget in self.passphrase_labels + [
+            self.passphrase_text,
+            self.confirm_text,
+            self.encrypt_warning,
+        ]:
+            widget.Show(show)
+        # Hashing the unencrypted image only means something when the output
+        # is encrypted, so the option follows the encryption checkbox.
+        self.hash_both_checkbox.Enable(show)
+        if not show:
+            self.passphrase_text.SetValue("")
+            self.confirm_text.SetValue("")
+        self.Layout()
+        self.Fit()
+
+    def on_encrypt_toggled(self, event):
+        self._show_encryption_fields(self.encrypt_checkbox.GetValue())
+
     def describe_method(self, index: int):
         if index < len(self.description_labels):
             self.method_description.SetLabelMarkup(self.description_labels[index])
@@ -485,6 +551,28 @@ class InputWindow(wx.Frame):
             self.destination_picker.SetPath(temp_location)
 
     def on_continue(self, event):
+        if self.encrypt_checkbox.GetValue():
+            passphrase = self.passphrase_text.GetValue()
+            if not passphrase:
+                wx.MessageBox(
+                    "Enter a passphrase, or turn off encryption.",
+                    "Passphrase required",
+                    wx.OK | wx.ICON_WARNING,
+                )
+                return
+            if passphrase != self.confirm_text.GetValue():
+                wx.MessageBox(
+                    "The two passphrases do not match.",
+                    "Passphrases do not match",
+                    wx.OK | wx.ICON_WARNING,
+                )
+                return
+            PARAMS.passphrase = passphrase
+            PARAMS.hash_both = self.hash_both_checkbox.GetValue()
+        else:
+            PARAMS.passphrase = ""
+            PARAMS.hash_both = False
+
         PARAMS.case = self.case_text.Value
         PARAMS.examiner = self.examiner_text.Value
         PARAMS.notes = self.notes_text.Value
@@ -566,7 +654,14 @@ class OverviewWindow(wx.Frame):
             "Output destination": PARAMS.destination,
             "Temporary files": PARAMS.tmp,
             "Acquisition method": INPUT_WINDOW.method.name,
+            "Image encryption": "AES-256" if PARAMS.passphrase else "None",
         }
+        if PARAMS.passphrase:
+            data["Hashes recorded"] = (
+                "Encrypted and unencrypted image"
+                if PARAMS.hash_both
+                else "Encrypted image only"
+            )
         if not RECOVERY:
             data["Play sound"] = "Yes" if PARAMS.sound else "No"
 

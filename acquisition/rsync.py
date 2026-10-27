@@ -25,6 +25,14 @@ class RsyncMethod(AcquisitionMethod):
         source_info = self._gather_path_info(params.source)
         source_disk = source_info.disk_parent
 
+        if not source_disk:
+            # The source has no local device node (e.g. a volume shared from a
+            # Mac booted into recovery). There are no nested local mount points
+            # under it to de-duplicate, and rsync's -x already stops the copy
+            # crossing filesystem boundaries.
+            print("Source has no local device node, skipping exclusions.")
+            return []
+
         results = []
         for line in lines:
             if not (line.startswith("/dev/disk") and " on " in line):

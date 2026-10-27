@@ -30,6 +30,12 @@ class Parameters:
     tmp: Path = Path("/Volumes/Fuji")
     destination: Path = Path("/Volumes/Fuji")
     sound: bool = not RECOVERY
+    # Held in memory only. Never written to the report, shown in the overview,
+    # or passed on a command line -- see _run_status_stdin.
+    passphrase: str = ""
+    # Only meaningful when encrypting: also hash the plaintext image, which
+    # costs a second conversion pass and temporary room for both images.
+    hash_both: bool = False
 
 
 @dataclass
@@ -63,6 +69,8 @@ class Report:
     success: bool = False
     output_files: List[Path] = field(default_factory=list)
     result: HashedFile = None  # type: ignore
+    # Hashes of the plaintext image, when it was hashed before encryption.
+    plaintext_result: Optional[HashedFile] = None
 
 
 @dataclass
@@ -185,6 +193,54 @@ class AcquisitionMethod(ABC):
 
         return p.returncode
 
+    def _run_status_stdin(
+        self,
+        arguments: List[str],
+        stdin_data: str,
+        awake=True,
+        buffer_size=1024000,
+    ) -> int:
+        # Run a process in plain sight, feeding it data on stdin. Used for
+        # hdiutil's -stdinpass: unlike -passphrase it keeps the passphrase out
+        # of the process table, and it stops hdiutil falling back to a blocking
+        # GUI prompt when credentials are needed.
+        if awake:
+            arguments = ["caffeinate", "-dimsu"] + arguments
+
+        command = shlex.join(arguments) + " 2>&1"
+        p = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            shell=True,
+            universal_newlines=True,
+        )
+
+        # No trailing newline: hdiutil takes everything up to EOF as the
+        # passphrase, so a newline would become part of it.
+        process_stdin: IO[str] = p.stdin  # type: ignore
+        try:
+            process_stdin.write(stdin_data)
+            process_stdin.flush()
+        finally:
+            process_stdin.close()
+
+        stdout: IO[str] = p.stdout  # type: ignore
+        encoding: str = stdout.encoding  # type: ignore
+        while True:
+            # Let it breathe and avoid the UI getting stuck
+            time.sleep(0.1)
+            out = self._limited_read(stdout, buffer_size, encoding)
+            if out:
+                sys.stdout.write(out)
+
+            if p.poll() != None:
+                out = stdout.read()
+                sys.stdout.write(out)
+                break
+
+        return p.returncode
+
     def _run_dots(
         self, arguments: List[str], awake=True, redirect=Path(os.devnull)
     ) -> int:
@@ -207,6 +263,20 @@ class AcquisitionMethod(ABC):
         chunk = device[9:].split("s")[0]
         return "/dev/disk" + chunk
 
+    def _filesystem_from_mount(self, path: Path) -> str:
+        # Best-effort filesystem type for a mount point, read from `mount`.
+        # Used when diskutil cannot identify the volume, e.g. a disk shared
+        # from a Mac booted into recovery.
+        _, mount_output = self._run_silent(["mount"], awake=False)
+        target = os.path.realpath(path)
+        for line in mount_output.splitlines():
+            if " on " not in line or "(" not in line:
+                continue
+            point = line.split(" on ", 1)[1].rsplit("(", 1)[0].strip()
+            if os.path.realpath(point) == target:
+                return line.rsplit("(", 1)[1].split(",")[0].strip()
+        return ""
+
     def _find_mount_point(self, path: Path) -> Path:
         path = Path(os.path.realpath(path))
         while not path.is_mount():
@@ -224,18 +294,49 @@ class AcquisitionMethod(ABC):
         sectors = int(disk_stats.f_blocks * disk_stats.f_frsize / 512)
 
         disk_device = ""
+        disk_info = ""
+        filesystem = ""
         if is_disk:
-            disk_info = subprocess.check_output(
-                ["diskutil", "info", f"{path}"], universal_newlines=True
-            )
-            diskutil_info = lines_to_properties(disk_info.splitlines())
+            try:
+                probe = subprocess.run(
+                    ["diskutil", "info", f"{path}"],
+                    capture_output=True,
+                    universal_newlines=True,
+                )
+                returncode, output = probe.returncode, probe.stdout + probe.stderr
+            except OSError as error:
+                returncode, output = 1, f"{error}"
 
-            valid = "Device Node" in diskutil_info
-            if valid:
-                disk_device = diskutil_info["Device Node"]
+            if returncode == 0:
+                disk_info = probe.stdout
+                diskutil_info = lines_to_properties(disk_info.splitlines())
+
+                valid = "Device Node" in diskutil_info
+                if valid:
+                    disk_device = diskutil_info["Device Node"]
+                else:
+                    is_disk = False
+                filesystem = diskutil_info.get("Type (Bundle)", "")
             else:
+                # diskutil exits non-zero for a mount point that is not backed
+                # by a local /dev/diskX device: a volume shared from a Mac
+                # booted into recovery, or any other network mount. It can
+                # still be acquired with a file-level method, so record the
+                # situation in the report and carry on rather than aborting.
+                # NOTE: is_disk stays False, so no device node and no disk
+                # metadata are available for this acquisition.
+                filesystem = self._filesystem_from_mount(path)
+                disk_info = (
+                    f"diskutil could not identify {path}\n"
+                    f"{output.strip()}\n"
+                    "\n"
+                    "Acquired as a NON-LOCAL volume: no device node and no "
+                    "disk-level metadata were available.\n"
+                    f"Filesystem reported by mount: {filesystem or 'unknown'}\n"
+                )
                 is_disk = False
-            filesystem = diskutil_info.get("Type (Bundle)", "")
+                print(f"Warning: diskutil could not identify {path}")
+                print("Continuing as a non-local volume (no disk metadata).")
         else:
             mount_point = self._find_mount_point(path)
             mount_info = self._gather_path_info(mount_point)
@@ -280,6 +381,22 @@ class AcquisitionMethod(ABC):
         best_filesystem = "HFS+"
         if report.path_details.filesystem == "apfs":
             best_filesystem = "APFS"
+        elif not report.path_details.disk_device:
+            # No device node means the source is not a local volume (e.g. a
+            # disk shared from a Mac booted into recovery), so diskutil could
+            # not report its real filesystem. Use case-sensitive APFS: the
+            # source is almost certainly an APFS Mac volume, and HFS+ would
+            # silently degrade extended attribute and permission handling.
+            # Case-sensitive is the safe direction when the source casing is
+            # unknown, as it round-trips a case-insensitive source, whereas a
+            # case-insensitive destination would collide names that differ
+            # only in case and lose files without an obvious error.
+            best_filesystem = "Case-sensitive APFS"
+            reported = report.path_details.filesystem or "unknown"
+            print(
+                f"Source filesystem could not be determined (mount reports "
+                f"{reported}), using case-sensitive APFS for the temporary image."
+            )
 
         # Add a bit of extra space to ensure the destination is large enough
         extra_gigabyte_sectors = 2 * 10**6
@@ -398,12 +515,48 @@ class AcquisitionMethod(ABC):
             return False
 
         temporary_output_path = Path(conversion_image.mount) / final_image_name
-        print("\nConverting", self.temporary_image.path, "->", temporary_output_path)
         sparseimage = f"{self.temporary_image.path}"
         dmg = f"{temporary_output_path}"
-        result = self._run_status(
-            ["hdiutil", "convert", sparseimage, "-format", "UDZO", "-o", dmg]
-        )
+        encrypt = bool(params.passphrase)
+
+        if encrypt and params.hash_both:
+            # Convert to a plaintext image first so its hashes can be recorded,
+            # then encrypt that image. This costs a second conversion pass and
+            # needs room for both images on the conversion volume at once.
+            plaintext_path = (
+                Path(conversion_image.mount) / f"{params.image_name}-plaintext.dmg"
+            )
+            print("\nConverting", self.temporary_image.path, "->", plaintext_path)
+            result = self._run_status(
+                ["hdiutil", "convert", sparseimage, "-format", "UDZO", "-o",
+                 f"{plaintext_path}"]
+            )
+            if result != 0:
+                return False
+
+            report.plaintext_result = self._compute_hashes(plaintext_path)
+
+            print("\nEncrypting", plaintext_path, "->", temporary_output_path)
+            result = self._run_status_stdin(
+                ["hdiutil", "convert", f"{plaintext_path}", "-format", "UDZO",
+                 "-encryption", "AES-256", "-stdinpass", "-o", dmg],
+                params.passphrase,
+            )
+            # The plaintext image must not survive the acquisition.
+            plaintext_path.unlink(missing_ok=True)
+        else:
+            print("\nConverting", self.temporary_image.path, "->", temporary_output_path)
+            command = ["hdiutil", "convert", sparseimage, "-format", "UDZO"]
+            if encrypt:
+                print("Encrypting the image with AES-256...")
+                command.extend(["-encryption", "AES-256", "-stdinpass"])
+            command.extend(["-o", dmg])
+
+            if encrypt:
+                result = self._run_status_stdin(command, params.passphrase)
+            else:
+                result = self._run_status(command)
+
         success = result == 0
 
         if not success:
@@ -528,14 +681,31 @@ class AcquisitionMethod(ABC):
                 "Generated artifacts (including temporary ones):",
             ] + [f"    - {file}" for file in report.output_files]
 
+        encrypted = bool(report.parameters.passphrase)
+        hash_scope = (
+            " [of the ENCRYPTED image: decrypt before comparing against any "
+            "hash of the plaintext contents]"
+            if encrypted
+            else ""
+        )
+
         hashes = []
         if report.result:
             hashes = [
                 separator,
-                f"Computed hashes ({report.result.path.name}):",
+                f"Computed hashes ({report.result.path.name}){hash_scope}:",
                 f"    - MD5: {report.result.md5}",
                 f"    - SHA1: {report.result.sha1}",
                 f"    - SHA256: {report.result.sha256}",
+            ]
+        if report.plaintext_result:
+            hashes = hashes + [
+                separator,
+                "Computed hashes of the UNENCRYPTED image, before encryption "
+                "[this image was not retained]:",
+                f"    - MD5: {report.plaintext_result.md5}",
+                f"    - SHA1: {report.plaintext_result.sha1}",
+                f"    - SHA256: {report.plaintext_result.sha256}",
             ]
 
         with open(self.output_report, "w") as output:
@@ -553,6 +723,7 @@ class AcquisitionMethod(ABC):
                     f"End time: {datetime_string(report.end_time)}",
                     f"Source: {report.parameters.source}",
                     f"Acquisition method: {report.method.name}",
+                    f"Image encryption: {'AES-256' if encrypted else 'None'}",
                     f"Running in recovery environment: {'Yes' if RECOVERY else 'No'}",
                     separator,
                     report.hardware_info,

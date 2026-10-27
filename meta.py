@@ -1,4 +1,4 @@
-VERSION = "1.2.0"
+VERSION = "1.2.0-hn1"
 AUTHOR = "Andrea Lazzarotto"
 HOMEPAGE = "https://fujiapp.top"
 VOLUME_NAME = "FujiApp"
